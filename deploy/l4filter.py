@@ -4,13 +4,11 @@ Left4FiltersModel — Lightweight Portable ONNX Runtime Inference SDK & CLI.
 
 Dependencies: ONLY onnxruntime, numpy, pillow (NO PyTorch / transformers / timm required!).
 Supports:
-  - Joint text + single image
-  - Joint text + multiple preview gallery images (worst-case max aggregation)
+  - Joint workshop text and additional text entries with one or more preview images
   - Image-only
   - Text-only (< 0.4 ms CPU)
 
-Primary output: calibrated probability in [0, 1] for threshold-based sensitivity flagging
-or routing uncertain items to an LLM judge.
+Returns a routing score in [0, 1], category scores and optional evidence for suspicious components.
 """
 from __future__ import annotations
 
@@ -20,13 +18,17 @@ import json
 import math
 import re
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable, NamedTuple, Sequence
 
 import numpy as np
 import onnxruntime as ort
 from PIL import Image
 
-BBCODE_RE = re.compile(r"\[/?[a-zA-Z0-9*]+(?:=[^\]]*)?\]")
+BBCODE_RE = re.compile(
+    r"\[/?(?:\*|h[1-6]|b|i|u|s|strike|spoiler|noparse|code|hr|url|img|"
+    r"previewyoutube|youtube|video|list|olist|quote|table|tr|th|td|sup|sub|"
+    r"center|left|right|color|size|font)(?:=[^\]]*)?\]", re.IGNORECASE,
+)
 URL_RE = re.compile(r"https?://\S+|www\.\S+")
 WS_RE = re.compile(r"\s+")
 TOKEN_RE = re.compile(
@@ -74,6 +76,15 @@ SAFE_TRAP_RE = re.compile(
 
 VISUAL_PRIOR_DIM = 24
 LEXICAL_PRIOR_DIM = 18
+BASE_SCORES = ("prob", "gore_prob", "nsfw_prob")
+BASE_CATEGORIES = ("sensitive", "gore", "nsfw")
+CORPSE_CATEGORIES = ("corpse", "corpse_pile")
+
+
+class TextComponent(NamedTuple):
+    field: str
+    index: int | None
+    value: str
 
 
 def _clean_text(text: str | None, max_len: int = 1600) -> str:
@@ -290,8 +301,35 @@ def _load_pil(img_input: str | Path | bytes | Image.Image) -> Image.Image:
     if isinstance(img_input, Image.Image):
         return img_input.convert("RGB")
     if isinstance(img_input, (bytes, bytearray)):
-        return Image.open(io.BytesIO(img_input)).convert("RGB")
-    return Image.open(img_input).convert("RGB")
+        img_input = io.BytesIO(img_input)
+    with Image.open(img_input) as im:
+        return im.convert("RGB")
+
+
+def _text_excerpt(component: TextComponent, reasons: list[dict[str, Any]]) -> str:
+    text = _clean_text(component.value, max_len=256 if component.field == "title" else 1600)
+    anchor = None
+    for reason in reasons:
+        category = reason["category"]
+        if category == "gore":
+            patterns = (GORE_STRONG_RE, GORE_MILD_RE)
+            ignored = [m.span() for m in SAFE_TRAP_RE.finditer(text)]
+        elif category == "nsfw":
+            patterns = (NSFW_STRONG_RE, NSFW_MILD_RE)
+            ignored = []
+        else:
+            continue
+        matches = [
+            match for pattern in patterns for match in pattern.finditer(text)
+            if not any(start <= match.start() and match.end() <= end for start, end in ignored)
+        ]
+        if matches:
+            reason["matches"] = list(dict.fromkeys(m.group()[:80] for m in matches))[:3]
+            if anchor is None:
+                anchor = matches[0].start()
+    start = min(max((anchor or 0) - 48, 0), max(len(text) - 160, 0))
+    end = start + 160
+    return ("…" if start else "") + text[start:end].strip() + ("…" if end < len(text) else "")
 
 
 class Left4Filter:
@@ -316,6 +354,132 @@ class Left4Filter:
         self.head_sess = ort.InferenceSession(
             str(base / "fusion_head.onnx"), sess_options=opts, providers=["CPUExecutionProvider"]
         )
+        self.review_threshold = float(
+            self.config.get("recommended_thresholds", {}).get("escalate_to_llm", 0.20)
+        )
+        self.corpse_sess = None
+        corpse_config = self.config.get("corpse_detection")
+        if corpse_config is not None:
+            self.corpse_thresholds = np.array(
+                [corpse_config["thresholds"][name] for name in CORPSE_CATEGORIES], dtype=np.float32,
+            )
+            self.corpse_sess = ort.InferenceSession(
+                str(base / "corpse_head.onnx"), sess_options=opts, providers=["CPUExecutionProvider"]
+            )
+
+    def _encode_text(self, group: Sequence[TextComponent]) -> tuple[np.ndarray, np.ndarray] | None:
+        if not group:
+            return None
+        title = next((part.value for part in group if part.field == "title"), "")
+        desc = next((part.value for part in group if part.field in ("description", "texts")), "")
+        tags = [part.value for part in group if part.field == "tags"]
+        return extract_text_features(title, desc, tags, self.vocab_data)
+
+    def _encode_images(
+        self, images: Sequence[str | Path | bytes | Image.Image],
+    ) -> tuple[np.ndarray, np.ndarray] | None:
+        if not images:
+            return None
+        embeddings, priors = [], []
+        for start in range(0, len(images), 12):
+            pixels = []
+            for source in images[start:start + 12]:
+                with _load_pil(source) as im:
+                    pixels.append(preprocess_image(im, self.img_size))
+                    priors.append(extract_visual_priors(im))
+            embeddings.append(self.vis_sess.run(["img_emb"], {"pixel_values": np.stack(pixels)})[0])
+        return np.concatenate(embeddings), np.stack(priors)
+
+    def _score(
+        self, vision: tuple[np.ndarray, np.ndarray] | None, text: tuple[np.ndarray, np.ndarray] | None,
+    ) -> np.ndarray:
+        if vision is None and text is None:
+            return np.zeros((1, 3), dtype=np.float32)
+        if vision is None:
+            vision_features = (np.zeros((1, 512), np.float32), np.zeros((1, VISUAL_PRIOR_DIM), np.float32))
+        else:
+            vision_features = vision
+        n = len(vision_features[0])
+        if text is None:
+            text_features = (np.zeros((n, self.txt_dim), np.float32), np.zeros((n, LEXICAL_PRIOR_DIM), np.float32))
+        else:
+            text_features = tuple(np.repeat(feature[None], n, axis=0) for feature in text)
+        return self.head_sess.run(
+            ["probs"],
+            {
+                "img_emb": vision_features[0],
+                "img_priors": vision_features[1],
+                "txt_hash": text_features[0],
+                "txt_lex": text_features[1],
+                "has_img": np.full((n, 1), vision is not None, np.float32),
+                "has_txt": np.full((n, 1), text is not None, np.float32),
+            },
+        )[0]
+
+    def _reasons(
+        self, candidates: Iterable[tuple[str, np.ndarray, np.ndarray | None]],
+    ) -> list[dict[str, Any]]:
+        reasons: dict[str, dict[str, Any]] = {}
+        for support, scores, without_component in candidates:
+            scores = np.atleast_2d(scores)
+            delta = None
+            if without_component is not None:
+                delta = scores - without_component
+                crossed = (scores >= self.review_threshold) & (without_component < self.review_threshold)
+                scores = np.where((delta >= 0.08) | crossed, scores, 0.0)
+            for i, row in enumerate(scores.argmax(axis=0)):
+                category = BASE_CATEGORIES[i]
+                rounded = round(float(scores[row, i]), 6)
+                if rounded >= self.review_threshold and rounded > reasons.get(category, {}).get("score", 0):
+                    reason = {"category": category, "score": rounded, "support": support}
+                    if delta is not None:
+                        reason["delta"] = round(float(delta[row, i]), 6)
+                    reasons[category] = reason
+        specific = [reason["score"] for name, reason in reasons.items() if name != "sensitive"]
+        if "sensitive" in reasons and specific and max(specific) + 0.08 >= reasons["sensitive"]["score"]:
+            del reasons["sensitive"]
+        return sorted(reasons.values(), key=lambda reason: reason["score"], reverse=True)
+
+    def _evidence(self, refs, vision, groups, features, joint, corpses) -> list[dict[str, Any]]:
+        evidence: list[dict[str, Any]] = []
+        image_only = self._score(vision, None) if groups else joint[0]
+        text_only = [self._score(None, f) for f in features] if vision is not None else joint
+
+        def append(kind, field, index, reasons, **details):
+            if reasons:
+                entry = {"type": kind, "field": field, "score": max(r["score"] for r in reasons), "reasons": reasons}
+                if index is not None:
+                    entry["index"] = index
+                evidence.append({**entry, **details})
+
+        for i, (field, index) in enumerate(refs):
+            candidates = [("standalone", image_only[i], None)]
+            candidates.extend(("joint", scores[i], without[0]) for scores, without in zip(joint, text_only))
+            reasons = self._reasons(candidates)
+            if corpses is not None:
+                for category, score, threshold in zip(CORPSE_CATEGORIES, corpses[i], self.corpse_thresholds):
+                    if score >= threshold:
+                        reasons.append({"category": category, "score": round(float(score), 6), "support": "standalone"})
+            append("image", field, index, reasons)
+
+        for g, group in enumerate(groups):
+            for i, component in enumerate(group):
+                if len(group) == 1:
+                    candidates = [("standalone", text_only[g], None)]
+                    other_features = None
+                else:
+                    component_only = self._score(None, self._encode_text([component]))
+                    other_features = self._encode_text(group[:i] + group[i + 1:])
+                    other_text = self._score(None, other_features)
+                    candidates = [("standalone", component_only, None), ("text_context", text_only[g], other_text)]
+                if vision is not None:
+                    without = self._score(vision, other_features) if other_features is not None else image_only
+                    candidates.append(("joint", joint[g], without))
+                reasons = self._reasons(candidates)
+                if reasons:
+                    details = {"text": _text_excerpt(component, reasons)}
+                    append("text", component.field, component.index, reasons, **details)
+        return sorted(evidence, key=lambda item: item["score"], reverse=True)
 
     def predict(
         self,
@@ -325,82 +489,48 @@ class Left4Filter:
         tags: Sequence[str] | None = None,
         image: str | Path | bytes | Image.Image | None = None,
         images: Sequence[str | Path | bytes | Image.Image] | None = None,
-    ) -> dict[str, float]:
-        """
-        Predict calibrated probabilities for an L4D2 Workshop item.
-        Supports:
-          - text + image
-          - text + multiple gallery images (returns max sensitivity across gallery images)
-          - image-only
-          - text-only
+        texts: Sequence[str] | None = None,
+        explain: bool = False,
+    ) -> dict[str, Any]:
+        """Score each image with the workshop fields and with every additional text."""
+        if isinstance(texts, str):
+            raise TypeError("texts must be a sequence of strings")
+        structured = [
+            TextComponent(field, None, value)
+            for field, value in (("title", title), ("description", description))
+            if value and value.strip()
+        ]
+        structured.extend(TextComponent("tags", i, str(tag)) for i, tag in enumerate(tags or ()) if str(tag).strip())
+        groups = [structured] if structured else []
+        groups.extend([TextComponent("texts", i, value)] for i, value in enumerate(texts or ()) if value.strip())
+        features = [self._encode_text(group) for group in groups]
 
-        Returns dict with calibrated probabilities in [0, 1]:
-          {"prob": float, "gore_prob": float, "nsfw_prob": float}
-        """
-        has_txt = bool((title or "").strip() or (description or "").strip() or (tags and len(tags) > 0))
-        if has_txt:
-            th, tl = extract_text_features(title, description, tags, self.vocab_data)
-        else:
-            th = np.zeros(self.txt_dim, dtype=np.float32)
-            tl = np.zeros(LEXICAL_PRIOR_DIM, dtype=np.float32)
-
-        img_list: list[str | Path | bytes | Image.Image] = []
+        img_list, refs = [], []
         if image is not None:
             img_list.append(image)
+            refs.append(("image", None))
         if images:
             img_list.extend(images)
+            refs.extend(("images", i) for i in range(len(images)))
+        vision = self._encode_images(img_list)
+        joint = [self._score(vision, f) for f in features or [None]]
+        max_scores = np.maximum.reduce([scores.max(axis=0) for scores in joint])
+        result = {key: round(float(score), 6) for key, score in zip(BASE_SCORES, max_scores)}
 
-        if not img_list:
-            if not has_txt:
-                return {"prob": 0.0, "gore_prob": 0.0, "nsfw_prob": 0.0}
-            out = self.head_sess.run(
-                ["probs"],
-                {
-                    "img_emb": np.zeros((1, 512), dtype=np.float32),
-                    "img_priors": np.zeros((1, VISUAL_PRIOR_DIM), dtype=np.float32),
-                    "txt_hash": th[None, ...],
-                    "txt_lex": tl[None, ...],
-                    "has_img": np.zeros((1, 1), dtype=np.float32),
-                    "has_txt": np.ones((1, 1), dtype=np.float32),
-                },
-            )[0][0]
-            return {
-                "prob": round(float(out[0]), 6),
-                "gore_prob": round(float(out[1]), 6),
-                "nsfw_prob": round(float(out[2]), 6),
-            }
-
-        pils = [_load_pil(im) for im in img_list]
-        px_batch = np.stack([preprocess_image(im, self.img_size) for im in pils], axis=0)
-        pri_batch = np.stack([extract_visual_priors(im) for im in pils], axis=0)
-        emb_batch = self.vis_sess.run(["img_emb"], {"pixel_values": px_batch})[0]
-
-        n = len(pils)
-        th_batch = np.repeat(th[None, ...], n, axis=0)
-        tl_batch = np.repeat(tl[None, ...], n, axis=0)
-        has_img_b = np.ones((n, 1), dtype=np.float32)
-        has_txt_b = np.full((n, 1), 1.0 if has_txt else 0.0, dtype=np.float32)
-
-        probs = self.head_sess.run(
-            ["probs"],
-            {
-                "img_emb": emb_batch,
-                "img_priors": pri_batch,
-                "txt_hash": th_batch,
-                "txt_lex": tl_batch,
-                "has_img": has_img_b,
-                "has_txt": has_txt_b,
-            },
-        )[0]  # (N, 3)
-
-        return {
-            "prob": round(float(probs[:, 0].max()), 6),
-            "gore_prob": round(float(probs[:, 1].max()), 6),
-            "nsfw_prob": round(float(probs[:, 2].max()), 6),
-        }
+        corpses = None
+        if self.corpse_sess is not None:
+            if vision is not None:
+                corpses = self.corpse_sess.run(["corpse_probs"], {"img_emb": vision[0]})[0]
+                if np.any(corpses >= self.corpse_thresholds):
+                    result["prob"] = max(result["prob"], self.review_threshold)
+            for i, name in enumerate(CORPSE_CATEGORIES):
+                result[f"{name}_prob"] = round(float(corpses[:, i].max()), 6) if corpses is not None else 0.0
+        if explain:
+            result["evidence"] = self._evidence(refs, vision, groups, features, joint, corpses)
+        return result
 
     def predict_prob(self, **kwargs: Any) -> float:
-        """Convenience helper returning ONLY the scalar calibrated probability in [0, 1]."""
+        """Return the scalar sensitivity routing score in [0, 1]."""
         return self.predict(**kwargs)["prob"]
 
 
@@ -411,13 +541,18 @@ def main() -> None:
     ap.add_argument("--desc", default="")
     ap.add_argument("--tags", default="", help="Comma-separated workshop tags")
     ap.add_argument("--image", nargs="*", default=[], help="One or more image file paths")
-    ap.add_argument("--prob-only", action="store_true", help="Print only scalar sensitive probability")
+    ap.add_argument("--text", action="append", help="Additional text to score, repeatable")
+    ap.add_argument("--explain", action="store_true", help="Include evidence for suspicious image and text components")
+    ap.add_argument("--prob-only", action="store_true", help="Print only the scalar routing score")
     ap.add_argument("--threads", type=int, default=4)
     args = ap.parse_args()
 
     clf = Left4Filter(args.model_dir, num_threads=args.threads)
     tags = [t.strip() for t in args.tags.split(",") if t.strip()] if args.tags else None
-    res = clf.predict(title=args.title, description=args.desc, tags=tags, images=args.image or None)
+    res = clf.predict(
+        title=args.title, description=args.desc, tags=tags, images=args.image or None,
+        texts=args.text, explain=args.explain and not args.prob_only,
+    )
     if args.prob_only:
         print(f"{res['prob']:.6f}")
     else:

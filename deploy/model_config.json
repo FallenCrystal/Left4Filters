@@ -1,6 +1,6 @@
 {
   "model_name": "Left4FiltersModel",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "backbone": "MobileCLIP2-S0 (reparameterized)",
   "selected_quant_variant": "fp16w_vis_int8_head",
   "image_size": 256,
@@ -20,8 +20,16 @@
   "outputs": [
     "sensitive_prob",
     "gore_prob",
-    "nsfw_prob"
+    "nsfw_prob",
+    "corpse_prob",
+    "corpse_pile_prob"
   ],
+  "corpse_detection": {
+    "thresholds": {
+      "corpse": 0.3854,
+      "corpse_pile": 0.1985
+    }
+  },
   "recommended_thresholds": {
     "escalate_to_llm": 0.2,
     "direct_sensitive": 0.72,

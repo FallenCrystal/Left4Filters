@@ -9,11 +9,14 @@ POST /predict
       "title": "...",
       "description": "...",
       "tags": ["Textures"],
+      "texts": ["..."],               // optional additional texts
+      "explain": true,                // include component evidence
       "image_base64": "...",           // optional single base64 image
       "images_base64": ["...", "..."]  // optional list of base64 images
     }
   Response:
-    {"prob": 0.123456, "gore_prob": 0.081234, "nsfw_prob": 0.021000}
+    {"prob": 0.123456, "gore_prob": 0.081234, "nsfw_prob": 0.021000,
+     "corpse_prob": 0.02, "corpse_pile_prob": 0.01, "evidence": []}
 """
 from __future__ import annotations
 
@@ -52,16 +55,23 @@ def run_server(host: str, port: int, model_dir: str, threads: int) -> None:
                 length = int(self.headers.get("Content-Length", "0"))
                 raw = self.rfile.read(length)
                 req = json.loads(raw.decode("utf-8"))
-                imgs = []
-                if req.get("image_base64"):
-                    imgs.append(base64.b64decode(req["image_base64"]))
-                for b64 in req.get("images_base64") or []:
-                    imgs.append(base64.b64decode(b64))
+                image = req.get("image_base64")
+                texts = req.get("texts")
+                explain = req.get("explain", False)
+                if texts is not None and (
+                    not isinstance(texts, list) or any(not isinstance(value, str) for value in texts)
+                ):
+                    raise ValueError("texts must be an array of strings")
+                if not isinstance(explain, bool):
+                    raise ValueError("explain must be a boolean")
                 res = clf.predict(
                     title=req.get("title") or "",
                     description=req.get("description") or "",
                     tags=req.get("tags") or None,
-                    images=imgs or None,
+                    image=base64.b64decode(image) if image else None,
+                    images=[base64.b64decode(value) for value in (req.get("images_base64") or [])],
+                    texts=texts,
+                    explain=explain,
                 )
                 self._send(200, res)
             except Exception as e:

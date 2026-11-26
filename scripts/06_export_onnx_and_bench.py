@@ -55,34 +55,11 @@ def preprocess_pil_256(img: Image.Image) -> np.ndarray:
     return np.transpose(arr, (2, 0, 1))  # (3, 256, 256)
 
 
-def export_onnx_pair(
-    visual_backbone: torch.nn.Module,
-    fusion_head: MultimodalFusionHead,
-    out_dir: Path,
-) -> dict[str, Path]:
+def export_fusion_head(fusion_head: torch.nn.Module, out_dir: Path) -> tuple[Path, Path]:
     out_dir.mkdir(parents=True, exist_ok=True)
-    vis_wrap = VisualEncoderWrapper(visual_backbone).eval()
     fusion_head.eval()
-
-    vis_fp32 = out_dir / "vision_encoder_fp32.onnx"
     head_fp32 = out_dir / "fusion_head_fp32.onnx"
-
-    # 1. Export Vision Encoder (FP32)
-    dummy_px = torch.randn(1, 3, 256, 256)
-    torch.onnx.export(
-        vis_wrap,
-        (dummy_px,),
-        str(vis_fp32),
-        input_names=["pixel_values"],
-        output_names=["img_emb"],
-        dynamic_axes={"pixel_values": {0: "batch"}, "img_emb": {0: "batch"}},
-        opset_version=17,
-        do_constant_folding=True,
-        dynamo=False,
-    )
-    onnx.checker.check_model(str(vis_fp32))
-
-    # 2. Export Fusion Head (FP32)
+    head_int8 = out_dir / "fusion_head_int8.onnx"
     dummy_head_inputs = (
         torch.randn(1, 512),
         torch.randn(1, VISUAL_PRIOR_DIM),
@@ -111,10 +88,42 @@ def export_onnx_pair(
         dynamo=False,
     )
     onnx.checker.check_model(str(head_fp32))
+    quantize_dynamic(
+        model_input=str(head_fp32),
+        model_output=str(head_int8),
+        weight_type=QuantType.QUInt8,
+        op_types_to_quantize=["MatMul", "Gemm"],
+    )
+    return head_fp32, head_int8
+
+
+def export_onnx_pair(
+    visual_backbone: torch.nn.Module,
+    fusion_head: MultimodalFusionHead,
+    out_dir: Path,
+) -> dict[str, Path]:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    vis_wrap = VisualEncoderWrapper(visual_backbone).eval()
+    vis_fp32 = out_dir / "vision_encoder_fp32.onnx"
+
+    dummy_px = torch.randn(1, 3, 256, 256)
+    torch.onnx.export(
+        vis_wrap,
+        (dummy_px,),
+        str(vis_fp32),
+        input_names=["pixel_values"],
+        output_names=["img_emb"],
+        dynamic_axes={"pixel_values": {0: "batch"}, "img_emb": {0: "batch"}},
+        opset_version=17,
+        do_constant_folding=True,
+        dynamo=False,
+    )
+    onnx.checker.check_model(str(vis_fp32))
+
+    head_fp32, head_int8 = export_fusion_head(fusion_head, out_dir)
 
     # 3. Dynamic INT8 quantization (weight compression + fast CPU MatMul/Conv)
     vis_int8 = out_dir / "vision_encoder_int8.onnx"
-    head_int8 = out_dir / "fusion_head_int8.onnx"
 
     quantize_dynamic(
         model_input=str(vis_fp32),
@@ -122,13 +131,6 @@ def export_onnx_pair(
         weight_type=QuantType.QUInt8,
         op_types_to_quantize=["MatMul", "Gemm", "Conv"],
     )
-    quantize_dynamic(
-        model_input=str(head_fp32),
-        model_output=str(head_int8),
-        weight_type=QuantType.QUInt8,
-        op_types_to_quantize=["MatMul", "Gemm"],
-    )
-
     # Also test MatMul-only INT8 for vision (often zero accuracy loss + tiny size!)
     vis_mm_int8 = out_dir / "vision_encoder_mm_int8.onnx"
     quantize_dynamic(

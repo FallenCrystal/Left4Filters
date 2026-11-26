@@ -16,7 +16,11 @@ from typing import Any, Iterable
 import numpy as np
 from PIL import Image
 
-BBCODE_RE = re.compile(r"\[/?[a-zA-Z0-9*]+(?:=[^\]]*)?\]")
+BBCODE_RE = re.compile(
+    r"\[/?(?:\*|h[1-6]|b|i|u|s|strike|spoiler|noparse|code|hr|url|img|"
+    r"previewyoutube|youtube|video|list|olist|quote|table|tr|th|td|sup|sub|"
+    r"center|left|right|color|size|font)(?:=[^\]]*)?\]", re.IGNORECASE,
+)
 URL_RE = re.compile(r"https?://\S+|www\.\S+")
 WS_RE = re.compile(r"\s+")
 TOKEN_RE = re.compile(

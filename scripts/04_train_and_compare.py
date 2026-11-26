@@ -209,6 +209,7 @@ def build_feature_arrays(
     samples: list[dict[str, Any]],
     embs: np.ndarray,
     priors: np.ndarray,
+    vocab_data: dict[str, Any] | None = None,
 ) -> dict[str, np.ndarray]:
     n = len(samples)
     img_emb = np.zeros((n, embs.shape[1]), dtype=np.float32)
@@ -232,7 +233,7 @@ def build_feature_arrays(
         idx = s["cache_idx"]
         img_emb[i] = embs[idx]
         img_pri[i] = priors[idx]
-        h, l = extract_text_features(s["title"], s["desc"], s["tags"])
+        h, l = extract_text_features(s["title"], s["desc"], s["tags"], vocab_data)
         txt_hash[i] = h
         txt_lex[i] = l
 
@@ -455,6 +456,15 @@ def evaluate_model(
             has_txt,
         ).numpy()
 
+    return evaluate_predictions(probs, arr, mode), probs
+
+
+def evaluate_predictions(
+    probs: np.ndarray,
+    arr: dict[str, np.ndarray],
+    mode: str = "both",
+    thresholds: tuple[float, float] = (0.22, 0.72),
+) -> dict[str, float]:
     p_ov, p_gore, p_nsfw = probs[:, 0], probs[:, 1], probs[:, 2]
 
     if mode == "both":
@@ -516,8 +526,7 @@ def evaluate_model(
         metrics["anime_trap_mean_p"] = float(p_ov[m_at].mean())
         metrics["anime_trap_fpr_05"] = float((p_ov[m_at] >= 0.5).mean())
 
-    # Two-stage LLM routing summary at (low=0.22, high=0.72)
-    t_lo, t_hi = 0.22, 0.72
+    t_lo, t_hi = thresholds
     safe_zone = p_ov < t_lo
     llm_zone = (p_ov >= t_lo) & (p_ov < t_hi)
     block_zone = p_ov >= t_hi
@@ -529,7 +538,7 @@ def evaluate_model(
     if (y_int == 0).sum() > 0:
         metrics["gate_false_block_safe_rate"] = float((block_zone & (y_int == 0)).sum() / (y_int == 0).sum())
 
-    return metrics, probs
+    return metrics
 
 
 def eval_synth_red_stress(
@@ -597,6 +606,8 @@ def train_fusion_head(
     lr: float = 1.2e-3,
     weight_decay: float = 2e-2,
     seed: int = 42,
+    initial_state: dict[str, torch.Tensor] | None = None,
+    embedding_noise: float = 0.025,
 ) -> tuple[MultimodalFusionHead, float]:
     seed_everything(seed)
     tr = {k: v.copy() for k, v in train_arr.items()}
@@ -606,12 +617,16 @@ def train_fusion_head(
         va["img_emb"][:] = 0.0
 
     model = MultimodalFusionHead()
-    model.set_feature_stats(
-        torch.from_numpy(tr["img_pri"].mean(axis=0)),
-        torch.from_numpy(tr["img_pri"].std(axis=0)),
-        torch.from_numpy(tr["txt_lex"].mean(axis=0)),
-        torch.from_numpy(tr["txt_lex"].std(axis=0)),
-    )
+    if initial_state is not None:
+        model.load_state_dict(initial_state)
+        model.set_calibration(torch.ones(3), torch.zeros(3))
+    else:
+        model.set_feature_stats(
+            torch.from_numpy(tr["img_pri"].mean(axis=0)),
+            torch.from_numpy(tr["img_pri"].std(axis=0)),
+            torch.from_numpy(tr["txt_lex"].mean(axis=0)),
+            torch.from_numpy(tr["txt_lex"].std(axis=0)),
+        )
 
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs, eta_min=lr * 0.05)
@@ -635,7 +650,7 @@ def train_fusion_head(
             # Slight feature noise on embeddings for strong generalization
             emb_t = torch.from_numpy(tr["img_emb"][idx])
             if not zero_img_emb:
-                emb_t = F.normalize(emb_t + 0.025 * torch.randn_like(emb_t), dim=-1)
+                emb_t = F.normalize(emb_t + embedding_noise * torch.randn_like(emb_t), dim=-1)
 
             out = model.forward_logits(
                 emb_t,
