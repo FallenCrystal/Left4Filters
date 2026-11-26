@@ -17,7 +17,10 @@ import io
 import json
 import math
 import re
+from collections import OrderedDict
+from hashlib import sha256
 from pathlib import Path
+from threading import Lock
 from typing import Any, Iterable, NamedTuple, Sequence
 
 import numpy as np
@@ -76,6 +79,7 @@ SAFE_TRAP_RE = re.compile(
 
 VISUAL_PRIOR_DIM = 24
 LEXICAL_PRIOR_DIM = 18
+DEFAULT_VISION_CACHE_SIZE = 256
 BASE_SCORES = ("prob", "gore_prob", "nsfw_prob")
 BASE_CATEGORIES = ("sensitive", "gore", "nsfw")
 CORPSE_CATEGORIES = ("corpse", "corpse_pile")
@@ -335,24 +339,40 @@ def _text_excerpt(component: TextComponent, reasons: list[dict[str, Any]]) -> st
 class Left4Filter:
     """Portable CPU sensitivity classifier for L4D2 Workshop text + images."""
 
-    def __init__(self, model_dir: str | Path | None = None, num_threads: int = 4) -> None:
+    def __init__(
+        self,
+        model_dir: str | Path | None = None,
+        num_threads: int = 4,
+        *,
+        vision_cache_size: int = DEFAULT_VISION_CACHE_SIZE,
+    ) -> None:
+        if vision_cache_size < 0:
+            raise ValueError("vision_cache_size must be nonnegative")
         base = Path(model_dir) if model_dir is not None else Path(__file__).resolve().parent
         cfg_path = base / "model_config.json"
         self.config: dict[str, Any] = json.loads(cfg_path.read_text(encoding="utf-8")) if cfg_path.exists() else {}
         self.vocab_data: dict[str, Any] = json.loads((base / "text_vocab.json").read_text(encoding="utf-8"))
         self.txt_dim = int(self.vocab_data["vocab_size"])
         self.img_size = int(self.config.get("image_size", 256))
+        self._vision_cache_size = vision_cache_size
+        self._vision_cache: OrderedDict[
+            tuple[int, tuple[bytes, ...]], tuple[np.ndarray, np.ndarray]
+        ] = OrderedDict()
+        self._vision_cache_lock = Lock()
 
-        opts = ort.SessionOptions()
-        opts.intra_op_num_threads = num_threads
-        opts.inter_op_num_threads = 1
-        opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        vision_opts = ort.SessionOptions()
+        head_opts = ort.SessionOptions()
+        for opts in (vision_opts, head_opts):
+            opts.intra_op_num_threads = num_threads
+            opts.inter_op_num_threads = 1
+            opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        head_opts.add_session_config_entry("session.intra_op.allow_spinning", "0")
 
         self.vis_sess = ort.InferenceSession(
-            str(base / "vision_encoder.onnx"), sess_options=opts, providers=["CPUExecutionProvider"]
+            str(base / "vision_encoder.onnx"), sess_options=vision_opts, providers=["CPUExecutionProvider"]
         )
         self.head_sess = ort.InferenceSession(
-            str(base / "fusion_head.onnx"), sess_options=opts, providers=["CPUExecutionProvider"]
+            str(base / "fusion_head.onnx"), sess_options=head_opts, providers=["CPUExecutionProvider"]
         )
         self.review_threshold = float(
             self.config.get("recommended_thresholds", {}).get("escalate_to_llm", 0.20)
@@ -364,7 +384,7 @@ class Left4Filter:
                 [corpse_config["thresholds"][name] for name in CORPSE_CATEGORIES], dtype=np.float32,
             )
             self.corpse_sess = ort.InferenceSession(
-                str(base / "corpse_head.onnx"), sess_options=opts, providers=["CPUExecutionProvider"]
+                str(base / "corpse_head.onnx"), sess_options=head_opts, providers=["CPUExecutionProvider"]
             )
 
     def _encode_text(self, group: Sequence[TextComponent]) -> tuple[np.ndarray, np.ndarray] | None:
@@ -382,13 +402,49 @@ class Left4Filter:
             return None
         embeddings, priors = [], []
         for start in range(0, len(images), 12):
-            pixels = []
-            for source in images[start:start + 12]:
-                with _load_pil(source) as im:
-                    pixels.append(preprocess_image(im, self.img_size))
-                    priors.append(extract_visual_priors(im))
-            embeddings.append(self.vis_sess.run(["img_emb"], {"pixel_values": np.stack(pixels)})[0])
-        return np.concatenate(embeddings), np.stack(priors)
+            batch_embeddings, batch_priors = self._cached_image_batch(images[start:start + 12])
+            embeddings.append(batch_embeddings)
+            priors.append(batch_priors)
+        return np.concatenate(embeddings), np.concatenate(priors)
+
+    def _cached_image_batch(
+        self, images: Sequence[str | Path | bytes | Image.Image],
+    ) -> tuple[np.ndarray, np.ndarray]:
+        if not self._vision_cache_size or not all(
+            isinstance(source, (str, Path, bytes, bytearray)) for source in images
+        ):
+            return self._encode_image_batch(images)
+
+        contents = [
+            Path(source).read_bytes() if isinstance(source, (str, Path)) else bytes(source)
+            for source in images
+        ]
+        # Keep the original batch and row order so a hit reproduces the encoder's inputs.
+        key = (self.img_size, tuple(sha256(data).digest() for data in contents))
+        with self._vision_cache_lock:
+            cached = self._vision_cache.get(key)
+            if cached is not None:
+                self._vision_cache.move_to_end(key)
+                return cached
+
+        features = self._encode_image_batch(contents)
+        with self._vision_cache_lock:
+            self._vision_cache[key] = features
+            self._vision_cache.move_to_end(key)
+            if len(self._vision_cache) > self._vision_cache_size:
+                self._vision_cache.popitem(last=False)
+        return features
+
+    def _encode_image_batch(
+        self, images: Sequence[str | Path | bytes | Image.Image],
+    ) -> tuple[np.ndarray, np.ndarray]:
+        pixels, priors = [], []
+        for source in images:
+            with _load_pil(source) as im:
+                pixels.append(preprocess_image(im, self.img_size))
+                priors.append(extract_visual_priors(im))
+        embeddings = self.vis_sess.run(["img_emb"], {"pixel_values": np.stack(pixels)})[0]
+        return embeddings, np.stack(priors)
 
     def _score(
         self, vision: tuple[np.ndarray, np.ndarray] | None, text: tuple[np.ndarray, np.ndarray] | None,
@@ -547,7 +603,7 @@ def main() -> None:
     ap.add_argument("--threads", type=int, default=4)
     args = ap.parse_args()
 
-    clf = Left4Filter(args.model_dir, num_threads=args.threads)
+    clf = Left4Filter(args.model_dir, num_threads=args.threads, vision_cache_size=0)
     tags = [t.strip() for t in args.tags.split(",") if t.strip()] if args.tags else None
     res = clf.predict(
         title=args.title, description=args.desc, tags=tags, images=args.image or None,

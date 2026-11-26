@@ -26,11 +26,18 @@ import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from l4filter import Left4Filter
+from l4filter import DEFAULT_VISION_CACHE_SIZE, Left4Filter
 
 
-def run_server(host: str, port: int, model_dir: str, threads: int) -> None:
-    clf = Left4Filter(model_dir, num_threads=threads)
+def run_server(
+    host: str,
+    port: int,
+    model_dir: str,
+    threads: int,
+    *,
+    vision_cache_size: int = DEFAULT_VISION_CACHE_SIZE,
+) -> None:
+    clf = Left4Filter(model_dir, num_threads=threads, vision_cache_size=vision_cache_size)
 
     class Handler(BaseHTTPRequestHandler):
         def _send(self, code: int, payload: dict) -> None:
@@ -91,5 +98,9 @@ if __name__ == "__main__":
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--model-dir", default=str(Path(__file__).resolve().parent))
     ap.add_argument("--threads", type=int, default=4)
+    ap.add_argument(
+        "--vision-cache-size", type=int, default=DEFAULT_VISION_CACHE_SIZE,
+        help="Maximum cached image batches per process. Defaults to %(default)s. Use 0 to disable caching.",
+    )
     args = ap.parse_args()
-    run_server(args.host, args.port, args.model_dir, args.threads)
+    run_server(args.host, args.port, args.model_dir, args.threads, vision_cache_size=args.vision_cache_size)

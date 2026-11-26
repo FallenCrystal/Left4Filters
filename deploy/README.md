@@ -55,6 +55,12 @@ python server.py --host 127.0.0.1 --port 8090
 - `GET /health`
 - `POST /predict` accepts `title`, `description`, `tags`, `texts`, `image_base64`, `images_base64` and `explain` as optional JSON fields. Use an array of strings for `tags`, `texts` and `images_base64`.
 
+## Reusing image features
+
+A long-lived SDK instance or HTTP server caches the embeddings and visual priors of up to 256 image batches. The cache matches the encoded image contents in batch order (up to 12 images per batch) and reuses the features with the text from each request. Batches containing PIL objects use the standard inference path.
+
+Set `vision_cache_size` on `Left4Filter` or pass `--vision-cache-size` to `server.py` to change the capacity. A value of `0` disables the cache.
+
 ## Scores and evidence
 
 Each image is scored with the combined title, description and tags, and separately with each entry in `texts`. The response takes the maximum for each score across the request. Requests can also contain only images or only text.
