@@ -90,6 +90,8 @@ python scripts/bench_inference.py --vision-provider cuda --threads 1 --concurren
 
 The benchmark disables the feature cache and reports initialization, first prediction, warm P50/P95, throughput, score differences, and threshold crossings. It profiles the vision graph separately and checks that compute kernels ran on the requested accelerator. The timings cover local SDK prediction. Use representative Workshop images and leave timing logs off for latency comparisons.
 
+Each provider reports the predicted scores for the first item in `first_item_scores`. `max_absolute_score_delta` measures differences between providers across all items and rounds. `threshold_crossings` counts predictions for which the providers landed on different sides of a threshold.
+
 ## Reusing image features
 
 A long-lived SDK instance or HTTP server caches the embeddings and visual priors of up to 256 image batches. The cache matches the encoded image contents in batch order (up to 12 images per batch) and reuses the features with the text from each request. Batches containing PIL objects use the standard inference path.

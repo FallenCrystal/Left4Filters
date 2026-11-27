@@ -47,6 +47,7 @@ def benchmark(
         "p50_ms": round(float(np.median(latencies)), 3),
         "p95_ms": round(float(np.percentile(latencies, 95)), 3),
         "items_per_second": round(len(runs) / elapsed, 3),
+        "first_item_scores": scores[0],
     }
     return stats, scores
 
