@@ -84,10 +84,11 @@ VISUAL_PRIOR_DIM = 24
 LEXICAL_PRIOR_DIM = 18
 DEFAULT_VISION_CACHE_SIZE = 256
 CPU_PROVIDER = "CPUExecutionProvider"
+CUDA_PROVIDER = "CUDAExecutionProvider"
 VISION_PROVIDER_ENV = "LEFT4FILTERS_VISION_PROVIDER"
 VISION_PROVIDERS = {
     "cpu": (CPU_PROVIDER, {}),
-    "cuda": ("CUDAExecutionProvider", {"use_tf32": "0"}),
+    "cuda": (CUDA_PROVIDER, {"use_tf32": "0"}),
 }
 BASE_SCORES = ("prob", "gore_prob", "nsfw_prob")
 BASE_CATEGORIES = ("sensitive", "gore", "nsfw")
@@ -399,26 +400,35 @@ def _create_vision_session(
     if provider == CPU_PROVIDER:
         return _VisionSession(str(model_path), sess_options=options, providers=[CPU_PROVIDER])
 
+    runtime_help = (
+        "Install requirements-cuda.txt in the CUDA Python environment and verify the NVIDIA driver."
+        if provider == CUDA_PROVIDER else "Check the accelerator runtime libraries and device."
+    )
     available = ort.get_available_providers()
     if provider not in available:
         raise VisionProviderError(
             f"{provider} is unavailable in this ONNX Runtime installation. "
-            f"Available providers are {', '.join(available)}."
+            f"Available providers are {', '.join(available)}. {runtime_help}"
         )
 
     try:
+        if provider == CUDA_PROVIDER:
+            preload_dlls = getattr(ort, "preload_dlls", None)
+            if preload_dlls is not None:
+                # Prefer NVIDIA runtime wheels in this Python environment, then system libraries.
+                preload_dlls(directory="")
         session = _VisionSession(
             str(model_path), sess_options=options,
             providers=[(provider, provider_options), CPU_PROVIDER], enable_fallback=False,
         )
     except Exception as exc:
-        raise VisionProviderError(f"Could not initialize {provider}. {exc}") from exc
+        raise VisionProviderError(f"Could not initialize {provider}. {exc} {runtime_help}") from exc
 
     active = session.get_providers()
     if not active or active[0] != provider:
         raise VisionProviderError(
             f"ONNX Runtime could not activate {provider}. Active providers are {', '.join(active)}. "
-            "Check the accelerator runtime libraries and device."
+            f"{runtime_help}"
         )
     # Prevent session.run() from switching providers after features have been cached.
     session.disable_fallback()

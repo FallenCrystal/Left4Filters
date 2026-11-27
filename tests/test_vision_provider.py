@@ -15,10 +15,13 @@ class VisionProviderTests(unittest.TestCase):
         self.options = l4filter._session_options(1)
         session_patch = patch.object(l4filter, "_VisionSession")
         providers_patch = patch.object(l4filter.ort, "get_available_providers", return_value=[l4filter.CPU_PROVIDER])
+        preload_patch = patch.object(l4filter.ort, "preload_dlls", create=True)
         self.session = session_patch.start()
         self.providers = providers_patch.start()
+        self.preload = preload_patch.start()
         self.addCleanup(session_patch.stop)
         self.addCleanup(providers_patch.stop)
+        self.addCleanup(preload_patch.stop)
 
     def test_default_and_explicit_cpu(self):
         with patch.dict(os.environ):
@@ -33,28 +36,46 @@ class VisionProviderTests(unittest.TestCase):
             self.session.assert_called_once_with(
                 str(self.model_path), sess_options=self.options, providers=[l4filter.CPU_PROVIDER],
             )
+        self.preload.assert_not_called()
 
     def test_cuda_taken_from_managed_runner_environment(self):
-        active = ["CUDAExecutionProvider", l4filter.CPU_PROVIDER]
+        active = [l4filter.CUDA_PROVIDER, l4filter.CPU_PROVIDER]
         self.providers.return_value = active
-        self.session.return_value.get_providers.return_value = active
+        expected_session = self.session.return_value
+        expected_session.get_providers.return_value = active
+
+        def open_session(*args, **kwargs):
+            self.preload.assert_called_once_with(directory="")
+            return expected_session
+
+        self.session.side_effect = open_session
         with patch.dict(os.environ, {l4filter.VISION_PROVIDER_ENV: "cuda"}):
             selected = l4filter._create_vision_session(self.model_path, self.options, None)
-        self.assertIs(selected, self.session.return_value)
+        self.assertIs(selected, expected_session)
         self.session.assert_called_once_with(
             str(self.model_path), sess_options=self.options,
-            providers=[("CUDAExecutionProvider", {"use_tf32": "0"}), l4filter.CPU_PROVIDER],
+            providers=[(l4filter.CUDA_PROVIDER, {"use_tf32": "0"}), l4filter.CPU_PROVIDER],
             enable_fallback=False,
         )
         selected.disable_fallback.assert_called_once_with()
+
+    def test_cuda_without_preload_api_uses_system_libraries(self):
+        active = [l4filter.CUDA_PROVIDER, l4filter.CPU_PROVIDER]
+        self.providers.return_value = active
+        self.session.return_value.get_providers.return_value = active
+        with patch.object(l4filter.ort, "preload_dlls", None):
+            selected = l4filter._create_vision_session(self.model_path, self.options, "cuda")
+        self.assertIs(selected, self.session.return_value)
+        self.preload.assert_not_called()
 
     def test_unavailable_cuda_fails_before_starting_session(self):
         with self.assertRaisesRegex(l4filter.VisionProviderError, "CUDAExecutionProvider is unavailable"):
             l4filter._create_vision_session(self.model_path, self.options, "cuda")
         self.session.assert_not_called()
+        self.preload.assert_not_called()
 
     def test_session_fallback_is_not_reported_as_cuda(self):
-        self.providers.return_value = ["CUDAExecutionProvider", l4filter.CPU_PROVIDER]
+        self.providers.return_value = [l4filter.CUDA_PROVIDER, l4filter.CPU_PROVIDER]
         self.session.return_value.get_providers.return_value = [l4filter.CPU_PROVIDER]
         with self.assertRaisesRegex(l4filter.VisionProviderError, "could not activate CUDAExecutionProvider"):
             l4filter._create_vision_session(self.model_path, self.options, "cuda")

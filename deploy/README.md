@@ -57,13 +57,15 @@ python server.py --host 127.0.0.1 --port 8090
 
 ## Vision providers
 
-For CUDA, use a dedicated virtual environment with the GPU distribution of ONNX Runtime and compatible CUDA and cuDNN libraries. That distribution also includes the CPU provider for comparisons. See the [ONNX Runtime CUDA requirements](https://onnxruntime.ai/docs/execution-providers/CUDA-ExecutionProvider.html#requirements).
+For CUDA, use a dedicated virtual environment with a compatible NVIDIA driver. `requirements-cuda.txt` installs the ONNX Runtime GPU distribution and its CUDA and cuDNN runtime wheels. Left4Filters preloads these libraries when CUDA is selected. The GPU distribution includes the CPU provider for comparisons. Windows also requires the Microsoft Visual C++ runtime. [CUDA requirements](https://onnxruntime.ai/docs/execution-providers/CUDA-ExecutionProvider.html#requirements) · [Visual C++ Redistributable](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist)
 
 ```bash
-python -m pip install 'onnxruntime-gpu>=1.18' 'numpy>=1.24' 'pillow>=10'
+python -m pip install -r requirements-cuda.txt
 python l4filter.py --vision-provider cuda --image cover.jpg
 python server.py --vision-provider cuda
 ```
+
+PyPI builds of ONNX Runtime GPU 1.27 and later target CUDA 13.0 or newer. For a driver that supports CUDA 12.8 but lacks CUDA 13 support, install with `python -m pip install -r requirements-cuda.txt "onnxruntime-gpu<1.27"`. Install the CUDA requirements in place of the CPU `requirements.txt` in the GPU environment. [CUDA and cuDNN version table](https://onnxruntime.ai/docs/execution-providers/CUDA-ExecutionProvider.html#requirements)
 
 Use `vision_provider="cuda"` with the Python SDK. The SDK, CLI, and HTTP server also read `LEFT4FILTERS_VISION_PROVIDER` on initialization. An explicit argument takes precedence. The fusion and corpse heads use CPU. CUDA runs the shipped vision graph with TF32 disabled for the initial score comparison. An explicit CUDA request fails with an error if the provider cannot initialize.
 
