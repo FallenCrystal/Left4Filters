@@ -26,7 +26,13 @@ import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from l4filter import DEFAULT_VISION_CACHE_SIZE, Left4Filter
+from l4filter import (
+    DEFAULT_VISION_CACHE_SIZE,
+    VISION_PROVIDER_ENV,
+    VISION_PROVIDERS,
+    Left4Filter,
+    VisionProviderError,
+)
 
 
 def run_server(
@@ -36,8 +42,11 @@ def run_server(
     threads: int,
     *,
     vision_cache_size: int = DEFAULT_VISION_CACHE_SIZE,
+    vision_provider: str | None = None,
 ) -> None:
-    clf = Left4Filter(model_dir, num_threads=threads, vision_cache_size=vision_cache_size)
+    clf = Left4Filter(
+        model_dir, num_threads=threads, vision_cache_size=vision_cache_size, vision_provider=vision_provider,
+    )
 
     class Handler(BaseHTTPRequestHandler):
         def _send(self, code: int, payload: dict) -> None:
@@ -50,7 +59,11 @@ def run_server(
 
         def do_GET(self) -> None:
             if self.path == "/health":
-                self._send(200, {"status": "ok", "model": clf.config.get("model_name", "Left4FiltersModel")})
+                self._send(200, {
+                    "status": "ok",
+                    "model": clf.config.get("model_name", "Left4FiltersModel"),
+                    "vision_provider": clf.vision_provider,
+                })
             else:
                 self._send(404, {"error": "not_found"})
 
@@ -99,8 +112,18 @@ if __name__ == "__main__":
     ap.add_argument("--model-dir", default=str(Path(__file__).resolve().parent))
     ap.add_argument("--threads", type=int, default=4)
     ap.add_argument(
+        "--vision-provider", choices=VISION_PROVIDERS,
+        help=f"Vision encoder provider. Defaults to {VISION_PROVIDER_ENV} or cpu.",
+    )
+    ap.add_argument(
         "--vision-cache-size", type=int, default=DEFAULT_VISION_CACHE_SIZE,
         help="Maximum cached image batches per process. Defaults to %(default)s. Use 0 to disable caching.",
     )
     args = ap.parse_args()
-    run_server(args.host, args.port, args.model_dir, args.threads, vision_cache_size=args.vision_cache_size)
+    try:
+        run_server(
+            args.host, args.port, args.model_dir, args.threads,
+            vision_cache_size=args.vision_cache_size, vision_provider=args.vision_provider,
+        )
+    except VisionProviderError as exc:
+        ap.error(str(exc))

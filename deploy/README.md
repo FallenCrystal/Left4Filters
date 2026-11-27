@@ -1,6 +1,6 @@
 # Left4Filters — Portable Deployment Bundle
 
-Self-contained ONNX CPU inference bundle (~24 MB total).
+Self-contained ONNX inference bundle (~24 MB total). The vision encoder uses CPU by default and can also run on CUDA.
 
 ## Install
 
@@ -52,8 +52,41 @@ python l4filter.py --prob-only --title "Mod Title" --image cover.jpg
 python server.py --host 127.0.0.1 --port 8090
 ```
 
-- `GET /health`
+- `GET /health` reports the model and `vision_provider`.
 - `POST /predict` accepts `title`, `description`, `tags`, `texts`, `image_base64`, `images_base64` and `explain` as optional JSON fields. Use an array of strings for `tags`, `texts` and `images_base64`.
+
+## Vision providers
+
+For CUDA, use a dedicated virtual environment with the GPU distribution of ONNX Runtime and compatible CUDA and cuDNN libraries. That distribution also includes the CPU provider for comparisons. See the [ONNX Runtime CUDA requirements](https://onnxruntime.ai/docs/execution-providers/CUDA-ExecutionProvider.html#requirements).
+
+```bash
+python -m pip install 'onnxruntime-gpu>=1.18' 'numpy>=1.24' 'pillow>=10'
+python l4filter.py --vision-provider cuda --image cover.jpg
+python server.py --vision-provider cuda
+```
+
+Use `vision_provider="cuda"` with the Python SDK. The SDK, CLI, and HTTP server also read `LEFT4FILTERS_VISION_PROVIDER` on initialization. An explicit argument takes precedence. The fusion and corpse heads use CPU. CUDA runs the shipped vision graph with TF32 disabled for the initial score comparison. An explicit CUDA request fails with an error if the provider cannot initialize.
+
+The Left4Addons managed runner inherits `LEFT4FILTERS_VISION_PROVIDER`. Launch it with a GPU-enabled Python environment when testing CUDA. The desktop installer's default `requirements.txt` selects the CPU distribution.
+
+`VISION_PROVIDERS` and `_create_vision_session` in `l4filter.py` handle provider registration and session setup. Intel OpenVINO GPU and AMD MIGraphX are candidates. A Windows DirectML implementation would also need to serialize concurrent `Run` calls on its session. [OpenVINO](https://onnxruntime.ai/docs/execution-providers/OpenVINO-ExecutionProvider.html) · [MIGraphX](https://onnxruntime.ai/docs/execution-providers/MIGraphX-ExecutionProvider.html) · [DirectML](https://onnxruntime.ai/docs/execution-providers/DirectML-ExecutionProvider.html#configuration-options)
+
+## Inference timings
+
+Set `LEFT4FILTERS_TIMING_LOG` before starting Python. Use an absolute file path to append to a log, or `-` to write to standard error. Logs include model startup, image preprocessing, vision encoding, cache hits, and total SDK prediction time. The Left4Addons fast path calls the vision session directly, so its log includes model startup and vision encoding.
+
+```bash
+LEFT4FILTERS_TIMING_LOG="$PWD/inference.log" python l4filter.py --vision-provider cuda --image cover.jpg
+```
+
+Run the benchmark from the repository root with the same images and runtime for CPU and CUDA. This example groups the images in pairs. Omit `--images-per-item 2` to measure single-image items.
+
+```bash
+python scripts/bench_inference.py --vision-provider cuda --threads 1 --concurrency 4 \
+  --images-per-item 2 cover1.jpg gallery1.jpg cover2.jpg gallery2.jpg
+```
+
+The benchmark disables the feature cache and reports initialization, first prediction, warm P50/P95, throughput, score differences, and threshold crossings. It profiles the vision graph separately and checks that compute kernels ran on the requested accelerator. The timings cover local SDK prediction. Use representative Workshop images and leave timing logs off for latency comparisons.
 
 ## Reusing image features
 

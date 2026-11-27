@@ -15,12 +15,15 @@ from __future__ import annotations
 import argparse
 import io
 import json
+import logging
 import math
+import os
 import re
 from collections import OrderedDict
 from hashlib import sha256
 from pathlib import Path
 from threading import Lock
+from time import perf_counter
 from typing import Any, Iterable, NamedTuple, Sequence
 
 import numpy as np
@@ -80,9 +83,27 @@ SAFE_TRAP_RE = re.compile(
 VISUAL_PRIOR_DIM = 24
 LEXICAL_PRIOR_DIM = 18
 DEFAULT_VISION_CACHE_SIZE = 256
+CPU_PROVIDER = "CPUExecutionProvider"
+VISION_PROVIDER_ENV = "LEFT4FILTERS_VISION_PROVIDER"
+VISION_PROVIDERS = {
+    "cpu": (CPU_PROVIDER, {}),
+    "cuda": ("CUDAExecutionProvider", {"use_tf32": "0"}),
+}
 BASE_SCORES = ("prob", "gore_prob", "nsfw_prob")
 BASE_CATEGORIES = ("sensitive", "gore", "nsfw")
 CORPSE_CATEGORIES = ("corpse", "corpse_pile")
+
+_TIMING_LOG = logging.getLogger("left4filters.inference")
+_timing_destination = os.getenv("LEFT4FILTERS_TIMING_LOG")
+if _timing_destination and not _TIMING_LOG.handlers:
+    _timing_handler = (
+        logging.StreamHandler() if _timing_destination == "-"
+        else logging.FileHandler(_timing_destination, encoding="utf-8")
+    )
+    _timing_handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+    _TIMING_LOG.addHandler(_timing_handler)
+    _TIMING_LOG.setLevel(logging.INFO)
+    _TIMING_LOG.propagate = False
 
 
 class TextComponent(NamedTuple):
@@ -336,8 +357,76 @@ def _text_excerpt(component: TextComponent, reasons: list[dict[str, Any]]) -> st
     return ("…" if start else "") + text[start:end].strip() + ("…" if end < len(text) else "")
 
 
+class VisionProviderError(RuntimeError):
+    """The requested ONNX Runtime vision provider could not be selected."""
+
+
+class _VisionSession(ort.InferenceSession):
+    def run(self, output_names, input_feed, run_options=None):
+        if not _TIMING_LOG.isEnabledFor(logging.INFO):
+            return super().run(output_names, input_feed, run_options)
+
+        start = perf_counter()
+        result = super().run(output_names, input_feed, run_options)
+        latency_ms = (perf_counter() - start) * 1000
+        pixels = input_feed.get("pixel_values")
+        image_count = pixels.shape[0] if isinstance(pixels, np.ndarray) else "unknown"
+        _TIMING_LOG.info(
+            "Vision inference provider=%s images=%s latency_ms=%.3f",
+            self.get_providers()[0], image_count, latency_ms,
+        )
+        return result
+
+
+def _session_options(num_threads: int) -> ort.SessionOptions:
+    options = ort.SessionOptions()
+    options.intra_op_num_threads = num_threads
+    options.inter_op_num_threads = 1
+    options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    return options
+
+
+def _create_vision_session(
+    model_path: Path, options: ort.SessionOptions, vision_provider: str | None,
+) -> ort.InferenceSession:
+    selection = vision_provider if vision_provider is not None else os.environ.get(VISION_PROVIDER_ENV, "cpu")
+    try:
+        provider, provider_options = VISION_PROVIDERS[selection.strip().lower()]
+    except KeyError:
+        supported = ", ".join(VISION_PROVIDERS)
+        raise VisionProviderError(f"Unknown vision provider {selection!r}. Choose from {supported}.") from None
+
+    if provider == CPU_PROVIDER:
+        return _VisionSession(str(model_path), sess_options=options, providers=[CPU_PROVIDER])
+
+    available = ort.get_available_providers()
+    if provider not in available:
+        raise VisionProviderError(
+            f"{provider} is unavailable in this ONNX Runtime installation. "
+            f"Available providers are {', '.join(available)}."
+        )
+
+    try:
+        session = _VisionSession(
+            str(model_path), sess_options=options,
+            providers=[(provider, provider_options), CPU_PROVIDER], enable_fallback=False,
+        )
+    except Exception as exc:
+        raise VisionProviderError(f"Could not initialize {provider}. {exc}") from exc
+
+    active = session.get_providers()
+    if not active or active[0] != provider:
+        raise VisionProviderError(
+            f"ONNX Runtime could not activate {provider}. Active providers are {', '.join(active)}. "
+            "Check the accelerator runtime libraries and device."
+        )
+    # Prevent session.run() from switching providers after features have been cached.
+    session.disable_fallback()
+    return session
+
+
 class Left4Filter:
-    """Portable CPU sensitivity classifier for L4D2 Workshop text + images."""
+    """Portable ONNX sensitivity classifier for L4D2 Workshop text and images."""
 
     def __init__(
         self,
@@ -345,7 +434,9 @@ class Left4Filter:
         num_threads: int = 4,
         *,
         vision_cache_size: int = DEFAULT_VISION_CACHE_SIZE,
+        vision_provider: str | None = None,
     ) -> None:
+        start = perf_counter()
         if vision_cache_size < 0:
             raise ValueError("vision_cache_size must be nonnegative")
         base = Path(model_dir) if model_dir is not None else Path(__file__).resolve().parent
@@ -360,19 +451,13 @@ class Left4Filter:
         ] = OrderedDict()
         self._vision_cache_lock = Lock()
 
-        vision_opts = ort.SessionOptions()
-        head_opts = ort.SessionOptions()
-        for opts in (vision_opts, head_opts):
-            opts.intra_op_num_threads = num_threads
-            opts.inter_op_num_threads = 1
-            opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        vision_opts = _session_options(num_threads)
+        head_opts = _session_options(num_threads)
         head_opts.add_session_config_entry("session.intra_op.allow_spinning", "0")
 
-        self.vis_sess = ort.InferenceSession(
-            str(base / "vision_encoder.onnx"), sess_options=vision_opts, providers=["CPUExecutionProvider"]
-        )
+        self.vis_sess = _create_vision_session(base / "vision_encoder.onnx", vision_opts, vision_provider)
         self.head_sess = ort.InferenceSession(
-            str(base / "fusion_head.onnx"), sess_options=head_opts, providers=["CPUExecutionProvider"]
+            str(base / "fusion_head.onnx"), sess_options=head_opts, providers=[CPU_PROVIDER]
         )
         self.review_threshold = float(
             self.config.get("recommended_thresholds", {}).get("escalate_to_llm", 0.20)
@@ -384,8 +469,18 @@ class Left4Filter:
                 [corpse_config["thresholds"][name] for name in CORPSE_CATEGORIES], dtype=np.float32,
             )
             self.corpse_sess = ort.InferenceSession(
-                str(base / "corpse_head.onnx"), sess_options=head_opts, providers=["CPUExecutionProvider"]
+                str(base / "corpse_head.onnx"), sess_options=head_opts, providers=[CPU_PROVIDER]
             )
+        if _TIMING_LOG.isEnabledFor(logging.INFO):
+            _TIMING_LOG.info(
+                "Model ready provider=%s threads=%d startup_ms=%.3f",
+                self.vision_provider, num_threads, (perf_counter() - start) * 1000,
+            )
+
+    @property
+    def vision_provider(self) -> str:
+        """Return the first-priority execution provider of the vision session."""
+        return self.vis_sess.get_providers()[0]
 
     def _encode_text(self, group: Sequence[TextComponent]) -> tuple[np.ndarray, np.ndarray] | None:
         if not group:
@@ -425,7 +520,9 @@ class Left4Filter:
             cached = self._vision_cache.get(key)
             if cached is not None:
                 self._vision_cache.move_to_end(key)
-                return cached
+        if cached is not None:
+            _TIMING_LOG.info("Vision feature cache hit images=%d", len(images))
+            return cached
 
         features = self._encode_image_batch(contents)
         with self._vision_cache_lock:
@@ -438,13 +535,17 @@ class Left4Filter:
     def _encode_image_batch(
         self, images: Sequence[str | Path | bytes | Image.Image],
     ) -> tuple[np.ndarray, np.ndarray]:
+        start = perf_counter()
         pixels, priors = [], []
         for source in images:
             with _load_pil(source) as im:
                 pixels.append(preprocess_image(im, self.img_size))
                 priors.append(extract_visual_priors(im))
-        embeddings = self.vis_sess.run(["img_emb"], {"pixel_values": np.stack(pixels)})[0]
-        return embeddings, np.stack(priors)
+        pixel_batch = np.stack(pixels)
+        prior_batch = np.stack(priors)
+        _TIMING_LOG.info("Image preprocessing images=%d latency_ms=%.3f", len(images), (perf_counter() - start) * 1000)
+        embeddings = self.vis_sess.run(["img_emb"], {"pixel_values": pixel_batch})[0]
+        return embeddings, prior_batch
 
     def _score(
         self, vision: tuple[np.ndarray, np.ndarray] | None, text: tuple[np.ndarray, np.ndarray] | None,
@@ -549,6 +650,7 @@ class Left4Filter:
         explain: bool = False,
     ) -> dict[str, Any]:
         """Score each image with the workshop fields and with every additional text."""
+        start = perf_counter()
         if isinstance(texts, str):
             raise TypeError("texts must be a sequence of strings")
         structured = [
@@ -583,6 +685,11 @@ class Left4Filter:
                 result[f"{name}_prob"] = round(float(corpses[:, i].max()), 6) if corpses is not None else 0.0
         if explain:
             result["evidence"] = self._evidence(refs, vision, groups, features, joint, corpses)
+        if _TIMING_LOG.isEnabledFor(logging.INFO):
+            _TIMING_LOG.info(
+                "Prediction provider=%s images=%d latency_ms=%.3f",
+                self.vision_provider, len(img_list), (perf_counter() - start) * 1000,
+            )
         return result
 
     def predict_prob(self, **kwargs: Any) -> float:
@@ -601,9 +708,18 @@ def main() -> None:
     ap.add_argument("--explain", action="store_true", help="Include evidence for suspicious image and text components")
     ap.add_argument("--prob-only", action="store_true", help="Print only the scalar routing score")
     ap.add_argument("--threads", type=int, default=4)
+    ap.add_argument(
+        "--vision-provider", choices=VISION_PROVIDERS,
+        help=f"Vision encoder provider. Defaults to {VISION_PROVIDER_ENV} or cpu.",
+    )
     args = ap.parse_args()
 
-    clf = Left4Filter(args.model_dir, num_threads=args.threads, vision_cache_size=0)
+    try:
+        clf = Left4Filter(
+            args.model_dir, num_threads=args.threads, vision_cache_size=0, vision_provider=args.vision_provider,
+        )
+    except VisionProviderError as exc:
+        ap.error(str(exc))
     tags = [t.strip() for t in args.tags.split(",") if t.strip()] if args.tags else None
     res = clf.predict(
         title=args.title, description=args.desc, tags=tags, images=args.image or None,
