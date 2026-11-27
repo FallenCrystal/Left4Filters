@@ -123,7 +123,7 @@ python deploy/l4filter.py \
 python deploy/server.py --host 127.0.0.1 --port 8090
 ```
 
-- `GET /health` → `{"status": "ok", "model": "Left4FiltersModel"}`
+- `GET /health` → `{"status": "ok", "model": "Left4FiltersModel", "vision_provider": "CPUExecutionProvider"}`
 - `POST /predict`
   ```json
   {
@@ -138,6 +138,8 @@ python deploy/server.py --host 127.0.0.1 --port 8090
   ```
 
 结果包含 `prob`、`gore_prob`、`nsfw_prob`、`corpse_prob` 和 `corpse_pile_prob`。`explain: true` 还会返回按嫌疑分降序排列的 `evidence`。列表下标从 0 开始，文本附有摘录，组合证据附有移除该组件后的分数降幅。字段和示例见 [部署文档](deploy/README.md)。
+
+视觉编码器可选用 CUDA。可通过 `LEFT4FILTERS_TIMING_LOG` 记录推理耗时，并用部署模型对照测量 CPU 和 CUDA 的延迟及分数差异。[CUDA 配置](deploy/README.md#vision-providers) · [日志与基准命令](deploy/README.md#inference-timings)
 
 ---
 
