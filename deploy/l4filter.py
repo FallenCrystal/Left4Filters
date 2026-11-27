@@ -85,11 +85,22 @@ LEXICAL_PRIOR_DIM = 18
 DEFAULT_VISION_CACHE_SIZE = 256
 CPU_PROVIDER = "CPUExecutionProvider"
 CUDA_PROVIDER = "CUDAExecutionProvider"
+WEBGPU_PROVIDER = "WebGpuExecutionProvider"
 VISION_PROVIDER_ENV = "LEFT4FILTERS_VISION_PROVIDER"
 VISION_PROVIDERS = {
     "cpu": (CPU_PROVIDER, {}),
     "cuda": (CUDA_PROVIDER, {"use_tf32": "0"}),
+    "webgpu": (WEBGPU_PROVIDER, {}),
 }
+RUNTIME_HELP = {
+    CUDA_PROVIDER: "Install requirements-cuda.txt in the CUDA Python environment and verify the NVIDIA driver.",
+    WEBGPU_PROVIDER: (
+        "Install requirements-webgpu.txt and update the GPU driver. "
+        "Linux also requires the Vulkan loader (libvulkan.so.1)."
+    ),
+}
+_ep_library_lock = Lock()
+_registered_ep_libraries: set[str] = set()
 BASE_SCORES = ("prob", "gore_prob", "nsfw_prob")
 BASE_CATEGORIES = ("sensitive", "gore", "nsfw")
 CORPSE_CATEGORIES = ("corpse", "corpse_pile")
@@ -387,6 +398,32 @@ def _session_options(num_threads: int) -> ort.SessionOptions:
     return options
 
 
+def _webgpu_plugin_device(runtime_help: str) -> Any:
+    """Register the WebGPU plugin library once per process and return its GPU device."""
+    try:
+        import onnxruntime_ep_webgpu as plugin
+    except ImportError:
+        raise VisionProviderError(f"{WEBGPU_PROVIDER} is unavailable. {runtime_help}") from None
+    if not hasattr(ort, "register_execution_provider_library"):
+        raise VisionProviderError(
+            f"ONNX Runtime {ort.__version__} cannot load plugin execution providers. {runtime_help}"
+        )
+
+    ep_name = plugin.get_ep_name()
+    with _ep_library_lock:
+        if ep_name not in _registered_ep_libraries:
+            try:
+                ort.register_execution_provider_library(ep_name, plugin.get_library_path())
+            except Exception as exc:
+                raise VisionProviderError(f"Could not register {ep_name}. {exc} {runtime_help}") from exc
+            _registered_ep_libraries.add(ep_name)
+
+    device = next((d for d in ort.get_ep_devices() if d.ep_name == ep_name), None)
+    if device is None:
+        raise VisionProviderError(f"{ep_name} found no compatible GPU adapter. {runtime_help}")
+    return device
+
+
 def _create_vision_session(
     model_path: Path, options: ort.SessionOptions, vision_provider: str | None,
 ) -> ort.InferenceSession:
@@ -400,12 +437,13 @@ def _create_vision_session(
     if provider == CPU_PROVIDER:
         return _VisionSession(str(model_path), sess_options=options, providers=[CPU_PROVIDER])
 
-    runtime_help = (
-        "Install requirements-cuda.txt in the CUDA Python environment and verify the NVIDIA driver."
-        if provider == CUDA_PROVIDER else "Check the accelerator runtime libraries and device."
-    )
+    runtime_help = RUNTIME_HELP.get(provider, "Check the accelerator runtime libraries and device.")
     available = ort.get_available_providers()
-    if provider not in available:
+    # The WebGPU EP usually comes from a plugin package installed next to the standard onnxruntime.
+    use_plugin = provider == WEBGPU_PROVIDER and provider not in available
+    if use_plugin:
+        device = _webgpu_plugin_device(runtime_help)
+    elif provider not in available:
         raise VisionProviderError(
             f"{provider} is unavailable in this ONNX Runtime installation. "
             f"Available providers are {', '.join(available)}. {runtime_help}"
@@ -417,10 +455,17 @@ def _create_vision_session(
             if preload_dlls is not None:
                 # Prefer NVIDIA runtime wheels in this Python environment, then system libraries.
                 preload_dlls(directory="")
-        session = _VisionSession(
-            str(model_path), sess_options=options,
-            providers=[(provider, provider_options), CPU_PROVIDER], enable_fallback=False,
-        )
+        if provider == WEBGPU_PROVIDER:
+            # Hide per-node placement warnings; ORT keeps shape ops and small scalar math on CPU.
+            options.log_severity_level = 3
+        if use_plugin:
+            options.add_provider_for_devices([device], provider_options)
+            session = _VisionSession(str(model_path), sess_options=options)
+        else:
+            session = _VisionSession(
+                str(model_path), sess_options=options,
+                providers=[(provider, provider_options), CPU_PROVIDER], enable_fallback=False,
+            )
     except Exception as exc:
         raise VisionProviderError(f"Could not initialize {provider}. {exc} {runtime_help}") from exc
 
