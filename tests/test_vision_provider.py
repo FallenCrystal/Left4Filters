@@ -4,7 +4,7 @@ import sys
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 from PIL import Image
 
@@ -101,11 +101,26 @@ class WebGpuProviderTests(unittest.TestCase):
             ),
             "registered": patch.object(l4filter, "_registered_ep_libraries", set()),
             "module": patch.dict(sys.modules, {"onnxruntime_ep_webgpu": self.plugin}),
+            "severity": patch.object(l4filter.ort, "set_default_logger_severity"),
         }
         for name, item in patches.items():
             setattr(self, name, item.start())
             self.addCleanup(item.stop)
         self.session.return_value.get_providers.return_value = [l4filter.WEBGPU_PROVIDER, l4filter.CPU_PROVIDER]
+
+    def test_placement_warnings_muted_only_during_setup(self):
+        self.session.side_effect = lambda *args, **kwargs: self.severity.assert_called_once_with(3) or MagicMock(
+            get_providers=MagicMock(return_value=[l4filter.WEBGPU_PROVIDER])
+        )
+        l4filter._create_vision_session(self.model_path, self.options, "webgpu")
+        self.assertEqual(self.options.log_severity_level, 3)
+        self.assertEqual(self.severity.call_args_list[-1], call(2))
+
+        self.severity.reset_mock()
+        self.session.side_effect = RuntimeError("device lost")
+        with self.assertRaisesRegex(l4filter.VisionProviderError, "device lost"):
+            l4filter._create_vision_session(self.model_path, self.options, "webgpu")
+        self.assertEqual(self.severity.call_args_list, [call(3), call(2)])
 
     def test_plugin_registered_once_and_bound_to_gpu_device(self):
         for _ in range(2):

@@ -101,6 +101,8 @@ RUNTIME_HELP = {
 }
 _ep_library_lock = Lock()
 _registered_ep_libraries: set[str] = set()
+ORT_LOG_WARNING = 2  # ONNX Runtime's default severity
+ORT_LOG_ERROR = 3
 BASE_SCORES = ("prob", "gore_prob", "nsfw_prob")
 BASE_CATEGORIES = ("sensitive", "gore", "nsfw")
 CORPSE_CATEGORIES = ("corpse", "corpse_pile")
@@ -456,8 +458,10 @@ def _create_vision_session(
                 # Prefer NVIDIA runtime wheels in this Python environment, then system libraries.
                 preload_dlls(directory="")
         if provider == WEBGPU_PROVIDER:
-            # Hide per-node placement warnings; ORT keeps shape ops and small scalar math on CPU.
-            options.log_severity_level = 3
+            # Hide placement warnings for shape ops and small scalar math that ORT keeps on CPU.
+            # The plugin reports them through the process-wide default logger during session setup.
+            options.log_severity_level = ORT_LOG_ERROR
+            ort.set_default_logger_severity(ORT_LOG_ERROR)
         if use_plugin:
             options.add_provider_for_devices([device], provider_options)
             session = _VisionSession(str(model_path), sess_options=options)
@@ -468,6 +472,9 @@ def _create_vision_session(
             )
     except Exception as exc:
         raise VisionProviderError(f"Could not initialize {provider}. {exc} {runtime_help}") from exc
+    finally:
+        if provider == WEBGPU_PROVIDER:
+            ort.set_default_logger_severity(ORT_LOG_WARNING)
 
     active = session.get_providers()
     if not active or active[0] != provider:
