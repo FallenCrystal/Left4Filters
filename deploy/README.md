@@ -1,6 +1,6 @@
 # Left4Filters — Portable Deployment Bundle
 
-Self-contained ONNX inference bundle (~24 MB total). The vision encoder uses CPU by default and can also run on CUDA.
+Self-contained ONNX inference bundle (~24 MB total). The vision encoder uses CPU by default and can also run on CUDA or, experimentally, WebGPU.
 
 ## Install
 
@@ -71,7 +71,23 @@ Use `vision_provider="cuda"` with the Python SDK. The SDK, CLI, and HTTP server 
 
 The Left4Addons managed runner inherits `LEFT4FILTERS_VISION_PROVIDER`. Launch it with a GPU-enabled Python environment when testing CUDA. The desktop installer's default `requirements.txt` selects the CPU distribution.
 
-`VISION_PROVIDERS` and `_create_vision_session` in `l4filter.py` handle provider registration and session setup. Intel OpenVINO GPU and AMD MIGraphX are candidates. A Windows DirectML implementation would also need to serialize concurrent `Run` calls on its session. [OpenVINO](https://onnxruntime.ai/docs/execution-providers/OpenVINO-ExecutionProvider.html) · [MIGraphX](https://onnxruntime.ai/docs/execution-providers/MIGraphX-ExecutionProvider.html) · [DirectML](https://onnxruntime.ai/docs/execution-providers/DirectML-ExecutionProvider.html#configuration-options)
+`VISION_PROVIDERS` and `_create_vision_session` in `l4filter.py` handle provider registration and session setup.
+
+### WebGPU (experimental)
+
+WebGPU runs the vision encoder on AMD, Intel, NVIDIA and Apple GPUs through D3D12 on Windows, Vulkan on Linux and Metal on macOS. `requirements-webgpu.txt` adds the `onnxruntime-ep-webgpu` plugin to the standard CPU distribution, so it can replace `requirements.txt` without a separate ONNX Runtime build. Linux requires the Vulkan loader (`libvulkan.so.1`) and a Vulkan driver. The plugin is pinned to its 0.6 series because its API is still pre-1.0. [WebGPU plugin](https://pypi.org/project/onnxruntime-ep-webgpu/)
+
+```bash
+python -m pip install -r requirements-webgpu.txt
+python l4filter.py --vision-provider webgpu --image cover.jpg
+python server.py --vision-provider webgpu
+```
+
+Left4Filters registers the plugin once per process and binds the vision session to the first WebGPU adapter. The `onnxruntime-webgpu` distribution, which builds the provider into ONNX Runtime, also works. The fusion and corpse heads stay on CPU, as do shape computations and a few small scalar operations in the vision graph. Concurrent requests can share the session. On a software Vulkan adapter, WebGPU and CPU scores agreed to within 0.00004 with no threshold crossings. GPU speed has not been measured yet, so compare `scripts/bench_inference.py --vision-provider webgpu` against CPU on the target machine before switching a deployment. The first prediction includes shader compilation, which favors long-running services over one-off CLI calls.
+
+On Windows, the plugin bundles a preview D3D12 Agility SDK that activates only with Developer Mode enabled. Test on a machine with Developer Mode turned off to confirm the behavior that end users get.
+
+DirectML is not supported. Microsoft has moved it to sustained engineering, and its `onnxruntime-directml` distribution is Windows-only, lags the main ONNX Runtime releases and replaces the `onnxruntime` package. WebGPU covers the same Windows GPUs through D3D12. Intel OpenVINO GPU and AMD MIGraphX remain candidates for vendor-specific providers. [DirectML status](https://onnxruntime.ai/docs/execution-providers/DirectML-ExecutionProvider.html) · [OpenVINO](https://onnxruntime.ai/docs/execution-providers/OpenVINO-ExecutionProvider.html) · [MIGraphX](https://onnxruntime.ai/docs/execution-providers/MIGraphX-ExecutionProvider.html)
 
 ## Inference timings
 

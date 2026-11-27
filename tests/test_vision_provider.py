@@ -1,8 +1,10 @@
 import io
 import os
+import sys
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 from PIL import Image
 
@@ -79,6 +81,65 @@ class VisionProviderTests(unittest.TestCase):
         self.session.return_value.get_providers.return_value = [l4filter.CPU_PROVIDER]
         with self.assertRaisesRegex(l4filter.VisionProviderError, "could not activate CUDAExecutionProvider"):
             l4filter._create_vision_session(self.model_path, self.options, "cuda")
+
+
+class WebGpuProviderTests(unittest.TestCase):
+    def setUp(self):
+        self.model_path = Path("vision_encoder.onnx")
+        self.options = MagicMock()
+        self.plugin = SimpleNamespace(
+            get_ep_name=lambda: l4filter.WEBGPU_PROVIDER, get_library_path=lambda: "/plugins/webgpu.so",
+        )
+        self.device = SimpleNamespace(ep_name=l4filter.WEBGPU_PROVIDER)
+        patches = {
+            "session": patch.object(l4filter, "_VisionSession"),
+            "providers": patch.object(l4filter.ort, "get_available_providers", return_value=[l4filter.CPU_PROVIDER]),
+            "register": patch.object(l4filter.ort, "register_execution_provider_library", create=True),
+            "devices": patch.object(
+                l4filter.ort, "get_ep_devices", create=True,
+                return_value=[SimpleNamespace(ep_name=l4filter.CPU_PROVIDER), self.device],
+            ),
+            "registered": patch.object(l4filter, "_registered_ep_libraries", set()),
+            "module": patch.dict(sys.modules, {"onnxruntime_ep_webgpu": self.plugin}),
+        }
+        for name, item in patches.items():
+            setattr(self, name, item.start())
+            self.addCleanup(item.stop)
+        self.session.return_value.get_providers.return_value = [l4filter.WEBGPU_PROVIDER, l4filter.CPU_PROVIDER]
+
+    def test_plugin_registered_once_and_bound_to_gpu_device(self):
+        for _ in range(2):
+            selected = l4filter._create_vision_session(self.model_path, self.options, "webgpu")
+        self.register.assert_called_once_with(l4filter.WEBGPU_PROVIDER, "/plugins/webgpu.so")
+        self.options.add_provider_for_devices.assert_called_with([self.device], {})
+        self.session.assert_called_with(str(self.model_path), sess_options=self.options)
+        selected.disable_fallback.assert_called_with()
+
+    def test_builtin_webgpu_provider_skips_plugin(self):
+        self.providers.return_value = [l4filter.WEBGPU_PROVIDER, l4filter.CPU_PROVIDER]
+        l4filter._create_vision_session(self.model_path, self.options, "webgpu")
+        self.register.assert_not_called()
+        self.session.assert_called_once_with(
+            str(self.model_path), sess_options=self.options,
+            providers=[(l4filter.WEBGPU_PROVIDER, {}), l4filter.CPU_PROVIDER], enable_fallback=False,
+        )
+
+    def test_missing_plugin_package(self):
+        with patch.dict(sys.modules, {"onnxruntime_ep_webgpu": None}):
+            with self.assertRaisesRegex(l4filter.VisionProviderError, "requirements-webgpu.txt"):
+                l4filter._create_vision_session(self.model_path, self.options, "webgpu")
+        self.session.assert_not_called()
+
+    def test_no_gpu_adapter(self):
+        self.devices.return_value = [SimpleNamespace(ep_name=l4filter.CPU_PROVIDER)]
+        with self.assertRaisesRegex(l4filter.VisionProviderError, "no compatible GPU adapter"):
+            l4filter._create_vision_session(self.model_path, self.options, "webgpu")
+        self.session.assert_not_called()
+
+    def test_cpu_fallback_is_not_reported_as_webgpu(self):
+        self.session.return_value.get_providers.return_value = [l4filter.CPU_PROVIDER]
+        with self.assertRaisesRegex(l4filter.VisionProviderError, "could not activate WebGpuExecutionProvider"):
+            l4filter._create_vision_session(self.model_path, self.options, "webgpu")
 
 
 class InferenceTimingTests(unittest.TestCase):
